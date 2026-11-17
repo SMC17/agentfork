@@ -1,0 +1,6 @@
+# agentfork
+> Sub-millisecond APFS clonefile(2) Copy-on-Write agent sandbox, wire-speed HTTP taint & Merkle receipt firewall, and proof-carrying merge gate in zero-dependency Zig 0.15.2.
+
+- `agentfork run <src_dir> <sandbox_dir> -- <cmd...>`: Clones `<src_dir>` via APFS `clonefile(2)` CoW and executes `<cmd...>` inside `<sandbox_dir>`.
+- `agentfork firewall --host 127.0.0.1 --port 8787 --audit receipts.jsonl`: Starts HTTP capability/taint firewall returning signed Blake3+HMAC-SHA256 receipts.
+- `agentfork bench`: Benchmarks in-memory CoW branch fork and IFC Merkle receipt signing latency.
