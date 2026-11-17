@@ -1,0 +1,87 @@
+name: 'agentfork'
+description: 'Gate CI repository/agent runs inside a sub-millisecond CoW sandbox with agentfork'
+inputs:
+  src_dir:
+    description: 'Source directory to fork into the isolated CoW sandbox'
+    required: false
+    default: '.'
+  sandbox_dir:
+    description: 'Destination directory for the CoW sandbox'
+    required: false
+    default: '${{ runner.temp }}/agentfork-sandbox'
+  command:
+    description: 'Shell command to execute inside the sandboxed workspace'
+    required: true
+  zig_version:
+    description: 'Zig compiler version used when building agentfork from source'
+    required: false
+    default: '0.15.2'
+  binary_path:
+    description: 'Optional path to a prebuilt agentfork binary; builds from action source if omitted'
+    required: false
+    default: ''
+
+outputs:
+  exit_code:
+    description: 'Exit code returned by the sandboxed command'
+    value: ${{ steps.run_agentfork.outputs.exit_code }}
+  used_cow_clonefile:
+    description: 'Whether OS-level APFS clonefile(2) CoW was used'
+    value: ${{ steps.run_agentfork.outputs.used_cow_clonefile }}
+  clone_us:
+    description: 'Workspace fork latency in microseconds'
+    value: ${{ steps.run_agentfork.outputs.clone_us }}
+  run_ms:
+    description: 'Sandboxed command execution duration in milliseconds'
+    value: ${{ steps.run_agentfork.outputs.run_ms }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Zig
+      if: inputs.binary_path == ''
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ inputs.zig_version }}
+
+    - name: Build agentfork
+      if: inputs.binary_path == ''
+      shell: bash
+      run: |
+        cd "${{ github.action_path }}"
+        zig build -Doptimize=ReleaseFast
+
+    - name: Run command in agentfork CoW sandbox
+      id: run_agentfork
+      shell: bash
+      env:
+        AF_SRC: ${{ inputs.src_dir }}
+        AF_SBX: ${{ inputs.sandbox_dir }}
+        AF_CMD: ${{ inputs.command }}
+        AF_BIN: ${{ inputs.binary_path != '' && inputs.binary_path || format('{0}/zig-out/bin/agentfork', github.action_path) }}
+      run: |
+        set -euo pipefail
+        raw_out="$("$AF_BIN" run "$AF_SRC" "$AF_SBX" -- bash -lc "$AF_CMD")"
+        meta_line="$(printf '%s\n' "$raw_out" | head -n 1)"
+        cmd_out="$(printf '%s\n' "$raw_out" | tail -n +2)"
+
+        eval "$(python3 -c '
+        import json, sys
+        m = json.loads(sys.argv[1])
+        print(f"EXIT_CODE={int(m[\"exit_code\"])}")
+        print(f"USED_COW={str(bool(m[\"used_cow_clonefile\"])).lower()}")
+        print(f"CLONE_US={int(m[\"clone_us\"])}")
+        print(f"RUN_MS={int(m[\"run_ms\"])}")
+        ' "$meta_line")"
+
+        {
+          echo "exit_code=$EXIT_CODE"
+          echo "used_cow_clonefile=$USED_COW"
+          echo "clone_us=$CLONE_US"
+          echo "run_ms=$RUN_MS"
+        } >> "$GITHUB_OUTPUT"
+
+        if [ -n "$cmd_out" ]; then
+          printf '%s\n' "$cmd_out"
+        fi
+        exit "$EXIT_CODE"
