@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Io = std.Io;
 
 /// OS-level Copy-on-Write workspace sandbox using macOS `clonefile(2)` (APFS O(1) CoW)
 /// with portable recursive-copy fallback on non-APFS/non-macOS filesystems.
@@ -19,7 +20,7 @@ pub const SandboxResult = struct {
     stderr: []const u8,
 };
 
-pub fn cloneWorkspace(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8) !bool {
+pub fn cloneWorkspace(allocator: std.mem.Allocator, io: Io, src_dir: []const u8, dst_dir: []const u8) !bool {
     if (builtin.os.tag == .macos) {
         const src_z = try allocator.dupeZ(u8, src_dir);
         defer allocator.free(src_z);
@@ -29,27 +30,27 @@ pub fn cloneWorkspace(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir
             return true;
         }
     }
-    try copyDirRecursive(allocator, src_dir, dst_dir);
+    try copyDirRecursive(allocator, io, src_dir, dst_dir);
     return false;
 }
 
-fn copyDirRecursive(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) !void {
-    try std.fs.cwd().makePath(dst_path);
-    var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
-    defer src_dir.close();
-    var dst_dir = try std.fs.cwd().openDir(dst_path, .{});
-    defer dst_dir.close();
+fn copyDirRecursive(allocator: std.mem.Allocator, io: Io, src_path: []const u8, dst_path: []const u8) !void {
+    try Io.Dir.cwd().createDirPath(io, dst_path);
+    var src_dir = try Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true });
+    defer src_dir.close(io);
+    var dst_dir = try Io.Dir.cwd().openDir(io, dst_path, .{});
+    defer dst_dir.close(io);
 
     var it = src_dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         const s_child = try std.fs.path.join(allocator, &.{ src_path, entry.name });
         defer allocator.free(s_child);
         const d_child = try std.fs.path.join(allocator, &.{ dst_path, entry.name });
         defer allocator.free(d_child);
 
         switch (entry.kind) {
-            .directory => try copyDirRecursive(allocator, s_child, d_child),
-            .file => try std.fs.Dir.copyFile(src_dir, entry.name, dst_dir, entry.name, .{}),
+            .directory => try copyDirRecursive(allocator, io, s_child, d_child),
+            .file => try Io.Dir.copyFile(src_dir, entry.name, dst_dir, entry.name, io, .{}),
             else => {},
         }
     }
@@ -57,35 +58,52 @@ fn copyDirRecursive(allocator: std.mem.Allocator, src_path: []const u8, dst_path
 
 pub fn runInCowSandbox(
     allocator: std.mem.Allocator,
+    io: Io,
     src_dir: []const u8,
     sandbox_dir: []const u8,
     argv: []const []const u8,
 ) !SandboxResult {
-    std.fs.cwd().deleteTree(sandbox_dir) catch {};
-    var timer = try std.time.Timer.start();
-    const used_cow = try cloneWorkspace(allocator, src_dir, sandbox_dir);
-    const clone_ns = timer.read();
+    Io.Dir.cwd().deleteTree(io, sandbox_dir) catch {};
+    const clone_start = Io.Clock.Timestamp.now(io, .awake);
+    const used_cow = try cloneWorkspace(allocator, io, src_dir, sandbox_dir);
+    const clone_ns: u64 = @intCast(clone_start.untilNow(io).raw.toNanoseconds());
 
-    timer.reset();
-    var child = std.process.Child.init(argv, allocator);
-    child.cwd = sandbox_dir;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
+    const run_start = Io.Clock.Timestamp.now(io, .awake);
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = sandbox_dir },
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
 
-    var stdout_buf = std.ArrayListUnmanaged(u8){};
-    defer stdout_buf.deinit(allocator);
-    var stderr_buf = std.ArrayListUnmanaged(u8){};
-    defer stderr_buf.deinit(allocator);
+    const max_output_bytes = 1024 * 1024;
+    var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
 
-    try child.collectOutput(allocator, &stdout_buf, &stderr_buf, 1024 * 1024);
-    const term = try child.wait();
-    const run_ns = timer.read();
+    while (multi_reader.fill(64, .none)) |_| {
+        if (multi_reader.reader(0).buffered().len > max_output_bytes) return error.StdoutStreamTooLong;
+        if (multi_reader.reader(1).buffered().len > max_output_bytes) return error.StderrStreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+    try multi_reader.checkAnyError();
+
+    const term = try child.wait(io);
+    const run_ns: u64 = @intCast(run_start.untilNow(io).raw.toNanoseconds());
 
     const code: u8 = switch (term) {
-        .Exited => |ec| ec,
+        .exited => |ec| ec,
         else => 255,
     };
+
+    const stdout = try multi_reader.toOwnedSlice(0);
+    errdefer allocator.free(stdout);
+    const stderr = try multi_reader.toOwnedSlice(1);
+    errdefer allocator.free(stderr);
 
     return .{
         .exit_code = code,
@@ -93,17 +111,18 @@ pub fn runInCowSandbox(
         .clone_ns = clone_ns,
         .run_ns = run_ns,
         .used_cow_clonefile = used_cow,
-        .stdout = try stdout_buf.toOwnedSlice(allocator),
-        .stderr = try stderr_buf.toOwnedSlice(allocator),
+        .stdout = stdout,
+        .stderr = stderr,
     };
 }
 
 test "cow_sandbox clones real directory and runs isolated child process" {
     const alloc = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const base_path = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(base_path);
 
     const src_dir = try std.fs.path.join(alloc, &.{ base_path, "repo" });
@@ -111,13 +130,13 @@ test "cow_sandbox clones real directory and runs isolated child process" {
     const sbx_dir = try std.fs.path.join(alloc, &.{ base_path, "sandbox" });
     defer alloc.free(sbx_dir);
 
-    try std.fs.cwd().makePath(src_dir);
+    try Io.Dir.cwd().createDirPath(io, src_dir);
     const orig_file = try std.fs.path.join(alloc, &.{ src_dir, "hello.txt" });
     defer alloc.free(orig_file);
-    try std.fs.cwd().writeFile(.{ .sub_path = orig_file, .data = "original" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = orig_file, .data = "original" });
 
     // Child mutates hello.txt inside sandbox only
-    const res = try runInCowSandbox(alloc, src_dir, sbx_dir, &.{
+    const res = try runInCowSandbox(alloc, io, src_dir, sbx_dir, &.{
         "/bin/sh",
         "-c",
         "echo mutated > hello.txt && cat hello.txt",
@@ -132,7 +151,7 @@ test "cow_sandbox clones real directory and runs isolated child process" {
     try std.testing.expectEqualStrings("mutated\n", res.stdout);
 
     // Original repo file must remain untouched
-    const orig_read = try std.fs.cwd().readFileAlloc(alloc, orig_file, 1024);
+    const orig_read = try Io.Dir.cwd().readFileAlloc(io, orig_file, alloc, .limited(1024));
     defer alloc.free(orig_read);
     try std.testing.expectEqualStrings("original", orig_read);
 }
