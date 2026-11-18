@@ -1,5 +1,7 @@
 # agentfork
 
+**[Status](STATUS.md) · [Roadmap](ROADMAP.md) · [Contributing](CONTRIBUTING.md) · [Issues](https://github.com/SMC17/agentfork/issues) · [Public roadmap](https://github.com/users/SMC17/projects/16)**
+
 **Sub-millisecond Copy-on-Write Agent Sandbox, Wire-Speed Taint Firewall, and Proof-Carrying Merge Gate.**
 
 Zero dependencies. Single static Zig binary. Built for autonomous coding and research agents that fork workspaces, execute untrusted tool pipelines, and prove invariants before touching `main`.
