@@ -57,7 +57,7 @@ pub const Receipt = struct {
 pub const TaintKernel = struct {
     allocator: std.mem.Allocator,
     signing_key: [32]u8,
-    receipts: std.ArrayListUnmanaged(Receipt) = .{},
+    receipts: std.ArrayList(Receipt) = .empty,
     last_chain_hash: [32]u8 = [_]u8{0} ** 32,
 
     pub fn init(allocator: std.mem.Allocator, signing_key: [32]u8) TaintKernel {

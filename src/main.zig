@@ -16,21 +16,21 @@ const usage =
     \\
 ;
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.arena.allocator();
+    const io = init.io;
+    const stdout = std.Io.File.stdout();
 
-    const args = try std.process.argsAlloc(alloc);
+    const args = try init.minimal.args.toSlice(alloc);
     if (args.len < 2) {
-        try std.fs.File.stdout().writeAll(usage);
+        try stdout.writeStreamingAll(io, usage);
         return;
     }
 
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "run")) {
         if (args.len < 5) {
-            try std.fs.File.stdout().writeAll("usage: agentfork run <src_dir> <sandbox_dir> -- <cmd...>\n");
+            try stdout.writeStreamingAll(io, "usage: agentfork run <src_dir> <sandbox_dir> -- <cmd...>\n");
             return;
         }
         var sep: ?usize = null;
@@ -44,7 +44,7 @@ pub fn main() !void {
         var argv = try alloc.alloc([]const u8, args.len - (s + 1));
         for (args[s + 1 ..], 0..) |a, i| argv[i] = a;
 
-        const res = try cow_sandbox.runInCowSandbox(alloc, args[2], args[3], argv);
+        const res = try cow_sandbox.runInCowSandbox(alloc, io, args[2], args[3], argv);
         var buf: [256]u8 = undefined;
         const msg = try std.fmt.bufPrint(&buf, "{{\"exit_code\":{d},\"used_cow_clonefile\":{},\"clone_us\":{d},\"run_ms\":{d}}}\n", .{
             res.exit_code,
@@ -52,8 +52,8 @@ pub fn main() !void {
             res.clone_ns / 1000,
             res.run_ns / 1_000_000,
         });
-        try std.fs.File.stdout().writeAll(msg);
-        if (res.stdout.len > 0) try std.fs.File.stdout().writeAll(res.stdout);
+        try stdout.writeStreamingAll(io, msg);
+        if (res.stdout.len > 0) try stdout.writeStreamingAll(io, res.stdout);
     } else if (std.mem.eql(u8, cmd, "firewall")) {
         var host: []const u8 = "127.0.0.1";
         var port: u16 = 8787;
@@ -76,36 +76,35 @@ pub fn main() !void {
             }
         }
         const key = [_]u8{0x5A} ** 32;
-        var fw = firewall_proxy.FirewallServer.init(alloc, key, audit);
+        var fw = firewall_proxy.FirewallServer.init(alloc, io, key, audit);
         defer fw.deinit();
         var buf: [128]u8 = undefined;
         const line = try std.fmt.bufPrint(&buf, "agentfork firewall listening on {s}:{d}\n", .{ host, port });
-        try std.fs.File.stdout().writeAll(line);
+        try stdout.writeStreamingAll(io, line);
         try fw.listenAndServe(host, port, max_req);
     } else if (std.mem.eql(u8, cmd, "bench")) {
-        var timer = try std.time.Timer.start();
         var fk = try fork.AgentForkKernel.init(alloc);
         defer fk.deinit();
         _ = try fk.writeFile(0, "src/app.zig", "pub fn main() void {}\n", 1);
-        timer.reset();
+        const fork_start = std.Io.Clock.Timestamp.now(io, .awake);
         var i: usize = 0;
         while (i < 1000) : (i += 1) _ = try fk.forkBranch(0, "spec");
-        const fork_ns = timer.read() / 1000;
+        const fork_ns: u64 = @intCast(@divTrunc(fork_start.untilNow(io).raw.toNanoseconds(), 1000));
 
         var tk = taint_receipt.TaintKernel.init(alloc, [_]u8{0x77} ** 32);
         defer tk.deinit();
-        timer.reset();
+        const taint_start = std.Io.Clock.Timestamp.now(io, .awake);
         i = 0;
         while (i < 2000) : (i += 1) {
             _ = try tk.authorizeAndRecord(.shell_exec, "bash", &.{.{ .bytes = "zig build test", .taint = taint_receipt.Taint.USER_INTENT }}, null, @intCast(i));
         }
-        const taint_ns = timer.read() / 2000;
+        const taint_ns: u64 = @intCast(@divTrunc(taint_start.untilNow(io).raw.toNanoseconds(), 2000));
 
         var buf: [160]u8 = undefined;
         const msg = try std.fmt.bufPrint(&buf, "{{\"fork_ns_per_branch\":{d},\"taint_ns_per_receipt\":{d}}}\n", .{ fork_ns, taint_ns });
-        try std.fs.File.stdout().writeAll(msg);
+        try stdout.writeStreamingAll(io, msg);
     } else {
-        try std.fs.File.stdout().writeAll(usage);
+        try stdout.writeStreamingAll(io, usage);
     }
 }
 

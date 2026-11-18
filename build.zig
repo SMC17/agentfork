@@ -8,19 +8,18 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     const exe = b.addExecutable(.{
         .name = "agentfork",
         .root_module = root_mod,
     });
-    exe.linkLibC();
     b.installArtifact(exe);
 
     const tests = b.addTest(.{
         .root_module = root_mod,
     });
-    tests.linkLibC();
     const run_tests = b.addRunArtifact(tests);
 
     const test_step = b.step("test", "Run all agentfork unit and integration tests");

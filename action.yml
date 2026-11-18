@@ -15,7 +15,7 @@ inputs:
   zig_version:
     description: 'Zig compiler version used when building agentfork from source'
     required: false
-    default: '0.15.2'
+    default: '0.16.0'
   binary_path:
     description: 'Optional path to a prebuilt agentfork binary; builds from action source if omitted'
     required: false

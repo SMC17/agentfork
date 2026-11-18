@@ -37,7 +37,7 @@ pub const Branch = struct {
     name: []const u8,
     head_snapshot: u32,
     parent_branch: ?u32,
-    steps: std.ArrayListUnmanaged(ToolStep),
+    steps: std.ArrayList(ToolStep),
     verified: bool,
 };
 
@@ -57,8 +57,8 @@ pub const DiffEntry = struct {
 pub const AgentForkKernel = struct {
     allocator: std.mem.Allocator,
     blobs: std.AutoHashMapUnmanaged(Hash256, []const u8) = .{},
-    snapshots: std.ArrayListUnmanaged(Snapshot) = .{},
-    branches: std.ArrayListUnmanaged(Branch) = .{},
+    snapshots: std.ArrayList(Snapshot) = .empty,
+    branches: std.ArrayList(Branch) = .empty,
     interned_paths: std.StringHashMapUnmanaged([]const u8) = .{},
 
     pub fn init(allocator: std.mem.Allocator) !AgentForkKernel {
@@ -76,7 +76,7 @@ pub const AgentForkKernel = struct {
             .name = try allocator.dupe(u8, "main"),
             .head_snapshot = 0,
             .parent_branch = null,
-            .steps = .{},
+            .steps = .empty,
             .verified = false,
         });
         return self;
@@ -148,7 +148,7 @@ pub const AgentForkKernel = struct {
         const ipath = try self.internPath(path);
         const ph = std.hash.Wyhash.hash(0, ipath);
 
-        var list = std.ArrayListUnmanaged(FileEntry){};
+        var list: std.ArrayList(FileEntry) = .empty;
         defer list.deinit(self.allocator);
 
         var replaced = false;
@@ -200,7 +200,7 @@ pub const AgentForkKernel = struct {
         const base = self.snapshots.items[br.head_snapshot];
         const ph = std.hash.Wyhash.hash(0, path);
 
-        var list = std.ArrayListUnmanaged(FileEntry){};
+        var list: std.ArrayList(FileEntry) = .empty;
         defer list.deinit(self.allocator);
         for (base.entries) |e| {
             if (!(e.path_hash == ph and std.mem.eql(u8, e.path, path))) {
@@ -230,7 +230,7 @@ pub const AgentForkKernel = struct {
             .name = try self.allocator.dupe(u8, name),
             .head_snapshot = src.head_snapshot,
             .parent_branch = source_branch,
-            .steps = .{},
+            .steps = .empty,
             .verified = false,
         });
         return new_id;
@@ -303,7 +303,7 @@ pub const AgentForkKernel = struct {
         }
         const a = self.snapshots.items[snap_a].entries;
         const b = self.snapshots.items[snap_b].entries;
-        var out = std.ArrayListUnmanaged(DiffEntry){};
+        var out: std.ArrayList(DiffEntry) = .empty;
         errdefer out.deinit(allocator);
 
         var i: usize = 0;
