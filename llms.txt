@@ -2,7 +2,7 @@
 > Copy-on-write directory clones for agent runs (APFS clonefile), a taint-label policy check with HMAC receipts, and an in-memory merge-gate model, in Zig 0.16. Prototype: not a sandbox.
 
 - `agentfork run <src_dir> <sandbox_dir> -- <cmd...>`: clone `<src_dir>` (APFS clonefile, else recursive copy) and run `<cmd...>` with the clone as working directory. No process, file or network isolation.
-- `agentfork firewall --host 127.0.0.1 --port 8787 --audit receipts.jsonl`: HTTP allow/deny service deciding from caller-supplied `X-Sink` / `X-Taint` headers; HMAC receipts (CLI key is hardcoded, see issue #3; missing headers fail open, see #4).
+- `agentfork firewall --host 127.0.0.1 --port 8787 --audit receipts.jsonl`: HTTP allow/deny service deciding from caller-supplied `X-Sink` / `X-Taint` headers; HMAC receipts chained by hash. Key from --key-file or AGENTFORK_RECEIPT_KEY (no default). Missing or unknown labels are refused (400 deny_unlabelled).
 - `agentfork bench`: in-memory branch fork and policy-decision latency (not filesystem clone time; that is `benchmarks/bench_cow.py`, ~12 ms for a 500-file repo on M2 Max).
 
 README.md is the source of truth, including measured numbers with hardware and commit.
