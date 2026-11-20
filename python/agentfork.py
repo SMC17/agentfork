@@ -175,10 +175,18 @@ def firewall(
     max_requests: int | None = None,
     binary: str | os.PathLike[str] | None = None,
     startup_timeout: float = 3.0,
+    key_hex: str | None = None,
 ) -> FirewallProcess:
-    """Start `agentfork firewall` and wait until its TCP port is accepting connections."""
+    """Start `agentfork firewall` and wait until its TCP port is accepting connections.
+
+    The receipt key (64 hex characters) comes from `key_hex`, else from the
+    AGENTFORK_RECEIPT_KEY environment variable. There is no default key.
+    """
     bin_path = resolve_binary(binary)
     argv = [bin_path, "firewall", "--host", host, "--port", str(port)]
+    env = dict(os.environ)
+    if key_hex is not None:
+        env["AGENTFORK_RECEIPT_KEY"] = key_hex
     if audit is not None:
         argv.extend(["--audit", os.fspath(audit)])
     if max_requests is not None:
@@ -189,6 +197,7 @@ def firewall(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=env,
     )
 
     deadline = time.monotonic() + startup_timeout

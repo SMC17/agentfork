@@ -25,27 +25,43 @@ pub const FirewallServer = struct {
         self.kernel.deinit();
     }
 
-    pub fn parseSink(s: []const u8) taint_receipt.SinkKind {
+    /// Names the five sinks. Anything else is not a sink this firewall knows,
+    /// and the request is refused rather than treated as a harmless read.
+    pub fn parseSink(s: []const u8) ?taint_receipt.SinkKind {
+        if (std.mem.eql(u8, s, "read_public")) return .read_public;
         if (std.mem.eql(u8, s, "shell_exec")) return .shell_exec;
         if (std.mem.eql(u8, s, "net_egress")) return .net_egress;
         if (std.mem.eql(u8, s, "file_write_workspace")) return .file_write_workspace;
         if (std.mem.eql(u8, s, "secret_store_read")) return .secret_store_read;
-        return .read_public;
+        return null;
     }
 
-    pub fn parseTaintMask(csv: []const u8) taint_receipt.TaintMask {
+    /// Parses a comma-separated label list. Returns null when the list is empty
+    /// or names a label this firewall does not know: an unreadable label must not
+    /// silently drop taint.
+    pub fn parseTaintMask(csv: []const u8) ?taint_receipt.TaintMask {
         var mask: taint_receipt.TaintMask = 0;
+        var any = false;
         var it = std.mem.splitScalar(u8, csv, ',');
         while (it.next()) |raw| {
             const tok = std.mem.trim(u8, raw, " \t\r\n");
-            if (std.mem.eql(u8, tok, "USER_INTENT")) mask |= taint_receipt.Taint.USER_INTENT;
-            if (std.mem.eql(u8, tok, "UNTRUSTED_WEB")) mask |= taint_receipt.Taint.UNTRUSTED_WEB;
-            if (std.mem.eql(u8, tok, "UNTRUSTED_EMAIL")) mask |= taint_receipt.Taint.UNTRUSTED_EMAIL;
-            if (std.mem.eql(u8, tok, "INTERNAL_SECRET")) mask |= taint_receipt.Taint.INTERNAL_SECRET;
-            if (std.mem.eql(u8, tok, "CREDENTIAL")) mask |= taint_receipt.Taint.CREDENTIAL;
-            if (std.mem.eql(u8, tok, "PII")) mask |= taint_receipt.Taint.PII;
+            if (tok.len == 0) continue;
+            any = true;
+            if (std.mem.eql(u8, tok, "USER_INTENT")) {
+                mask |= taint_receipt.Taint.USER_INTENT;
+            } else if (std.mem.eql(u8, tok, "UNTRUSTED_WEB")) {
+                mask |= taint_receipt.Taint.UNTRUSTED_WEB;
+            } else if (std.mem.eql(u8, tok, "UNTRUSTED_EMAIL")) {
+                mask |= taint_receipt.Taint.UNTRUSTED_EMAIL;
+            } else if (std.mem.eql(u8, tok, "INTERNAL_SECRET")) {
+                mask |= taint_receipt.Taint.INTERNAL_SECRET;
+            } else if (std.mem.eql(u8, tok, "CREDENTIAL")) {
+                mask |= taint_receipt.Taint.CREDENTIAL;
+            } else if (std.mem.eql(u8, tok, "PII")) {
+                mask |= taint_receipt.Taint.PII;
+            } else return null;
         }
-        return mask;
+        return if (any) mask else null;
     }
 
     pub fn handleConnection(self: *FirewallServer, stream: Io.net.Stream) !void {
@@ -59,8 +75,10 @@ pub const FirewallServer = struct {
         };
         const req = stream_reader.interface.buffered();
 
-        var sink_str: []const u8 = "read_public";
-        var taint_str: []const u8 = "USER_INTENT";
+        // No defaults: a request must say which sink it targets and what its
+        // input carries. Missing or unknown labels are refused (fail closed).
+        var sink_str: ?[]const u8 = null;
+        var taint_str: ?[]const u8 = null;
         var tool_str: []const u8 = "http_tool";
 
         // Split headers & body
@@ -79,36 +97,48 @@ pub const FirewallServer = struct {
             }
         }
 
-        const sink = parseSink(sink_str);
-        const mask = parseTaintMask(taint_str);
+        const sink = if (sink_str) |v| parseSink(v) else null;
+        const mask = if (taint_str) |v| parseTaintMask(v) else null;
+        if (sink == null or mask == null) {
+            const reason = if (sink_str == null)
+                "missing X-Sink"
+            else if (sink == null)
+                "unknown X-Sink"
+            else if (taint_str == null)
+                "missing X-Taint"
+            else
+                "unknown or empty X-Taint label";
+            var jb: [256]u8 = undefined;
+            const body_json = try std.fmt.bufPrint(&jb, "{{\"decision\":\"deny_unlabelled\",\"reason\":\"{s}\"}}\n", .{reason});
+            self.appendAudit(body_json);
+            var rb: [512]u8 = undefined;
+            const r = try std.fmt.bufPrint(&rb, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body_json.len, body_json });
+            try streamWriteAll(io, stream, r);
+            return;
+        }
         const now_ns: i128 = Io.Clock.real.now(io).toNanoseconds();
         const receipt = try self.kernel.authorizeAndRecord(
-            sink,
+            sink.?,
             tool_str,
-            &.{.{ .bytes = body, .taint = mask }},
+            &.{.{ .bytes = body, .taint = mask.? }},
             null,
             now_ns,
         );
 
         const hex_mac = std.fmt.bytesToHex(receipt.mac, .lower);
+        const hex_prev = std.fmt.bytesToHex(receipt.prev_chain_hash, .lower);
+        const hex_chain = std.fmt.bytesToHex(receipt.chain_hash, .lower);
         const allowed = receipt.decision == .allow;
         const status_line = if (allowed) "HTTP/1.1 200 OK" else "HTTP/1.1 403 Forbidden";
 
         var json_buf: [512]u8 = undefined;
         const json_body = try std.fmt.bufPrint(
             &json_buf,
-            "{{\"seq\":{d},\"decision\":\"{s}\",\"taint_in\":{d},\"mac\":\"{s}\"}}\n",
-            .{ receipt.seq, @tagName(receipt.decision), receipt.taint_in, hex_mac },
+            "{{\"seq\":{d},\"decision\":\"{s}\",\"taint_in\":{d},\"prev_chain_hash\":\"{s}\",\"chain_hash\":\"{s}\",\"mac\":\"{s}\"}}\n",
+            .{ receipt.seq, @tagName(receipt.decision), receipt.taint_in, hex_prev, hex_chain, hex_mac },
         );
 
-        if (self.audit_log_path) |p| {
-            const file = Io.Dir.cwd().createFile(io, p, .{ .truncate = false }) catch null;
-            if (file) |f| {
-                defer f.close(io);
-                const end = f.length(io) catch 0;
-                f.writePositionalAll(io, json_body, end) catch {};
-            }
-        }
+        self.appendAudit(json_body);
 
         var resp_buf: [1024]u8 = undefined;
         const resp = try std.fmt.bufPrint(
@@ -117,6 +147,15 @@ pub const FirewallServer = struct {
             .{ status_line, json_body.len, json_body },
         );
         try streamWriteAll(io, stream, resp);
+    }
+
+    fn appendAudit(self: *FirewallServer, line: []const u8) void {
+        const p = self.audit_log_path orelse return;
+        const io = self.io;
+        const file = Io.Dir.cwd().createFile(io, p, .{ .truncate = false }) catch return;
+        defer file.close(io);
+        const end = file.length(io) catch 0;
+        file.writePositionalAll(io, line, end) catch {};
     }
 
     pub fn listenAndServe(self: *FirewallServer, host: []const u8, port: u16, max_requests: ?usize) !void {
@@ -139,7 +178,7 @@ fn streamWriteAll(io: Io, stream: Io.net.Stream, bytes: []const u8) !void {
     };
 }
 
-test "FirewallServer live TCP HTTP proxy blocks tainted shell_exec and logs signed receipt" {
+test "FirewallServer blocks tainted shell_exec, refuses unlabelled requests, and chains receipts" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     const key = [_]u8{0x55} ** 32;
@@ -156,7 +195,7 @@ test "FirewallServer live TCP HTTP proxy blocks tainted shell_exec and logs sign
         fw: *FirewallServer,
         fn run(ctx: @This()) void {
             var i: usize = 0;
-            while (i < 2) : (i += 1) {
+            while (i < 5) : (i += 1) {
                 const stream = ctx.srv.accept(ctx.fw.io) catch return;
                 ctx.fw.handleConnection(stream) catch return;
             }
@@ -192,5 +231,25 @@ test "FirewallServer live TCP HTTP proxy blocks tainted shell_exec and logs sign
         try std.testing.expect(std.mem.indexOf(u8, resp[0..n], "403 Forbidden") != null);
     }
 
+    // 3-5. Missing or unknown labels are refused, not allowed.
+    const refused = [_][]const u8{
+        "POST /authorize HTTP/1.1\r\nHost: localhost\r\nX-Sink: shell_exec\r\nContent-Length: 3\r\n\r\nls\n",
+        "POST /authorize HTTP/1.1\r\nHost: localhost\r\nX-Sink: shel_exec\r\nX-Taint: USER_INTENT\r\nContent-Length: 3\r\n\r\nls\n",
+        "POST /authorize HTTP/1.1\r\nHost: localhost\r\nX-Sink: shell_exec\r\nX-Taint: USER_INTENT,UNTRUSTED_WBE\r\nContent-Length: 3\r\n\r\nls\n",
+    };
+    for (refused) |req| {
+        const c_addr = try Io.net.IpAddress.parse("127.0.0.1", port);
+        const c = try c_addr.connect(io, .{ .mode = .stream });
+        defer c.close(io);
+        try streamWriteAll(io, c, req);
+        var resp: [1024]u8 = undefined;
+        var c_reader = c.reader(io, &resp);
+        try c_reader.interface.fillMore();
+        const n = c_reader.interface.bufferedLen();
+        try std.testing.expect(std.mem.indexOf(u8, resp[0..n], "400 Bad Request") != null);
+        try std.testing.expect(std.mem.indexOf(u8, resp[0..n], "deny_unlabelled") != null);
+    }
+
     try std.testing.expect(fw.kernel.verifyChain());
 }
+
