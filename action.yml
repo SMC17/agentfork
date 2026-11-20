@@ -1,5 +1,5 @@
 name: 'agentfork'
-description: 'Gate CI repository/agent runs inside a sub-millisecond CoW sandbox with agentfork'
+description: 'Run a CI command in a copy-on-write clone of the repository with agentfork (a clone, not an isolation boundary)'
 inputs:
   src_dir:
     description: 'Source directory to fork into the isolated CoW sandbox'
